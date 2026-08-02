@@ -5,30 +5,18 @@ import numpy as np
 import requests
 
 # ==============================================================================
-# 1. PARÁMETROS Y DEFINICIÓN DE UNIVERSOS DE INVERSIÓN (TESIS OFICIAL)
+# 1. DEFINICIÓN DE PARÁMETROS Y OBTENCIÓN DINÁMICA DEL UNIVERSO S&P 500
 # ==============================================================================
 BENCHMARK = "SPY"
 REFUGIO_RENTA_FIJA = "SHY"    # Treasuries 1-3 Años (Preservación Táctica - 50% en Risk-Off)
 REFUGIO_CASH_LIQUIDEZ = "BIL" # Treasuries 1-3 Meses / Cash (Preservación Absoluta / Pánico)
-COBERTURA_BAJISTA = "PSQ"     # ProShares Short QQQ (-1x Inverso para Alfa Bajista)
-
-# Universo Sectorial / Factores Core Admisibles (75% NAV)
-UNIVERSO_CORE_SECTORIAL = [
-    "XLF", "XLE", "XLC", "XLI", "XLP", "XLV", "XLU", "EFA"
-]
-
-# Universo Satélite Agresivo / Alto Beta (25% NAV en Risk-On)
-UNIVERSO_SATELITE_ALTO_BETA = [
-    "XLK", "XLY", "SOXX"
-]
-
-FECHA_CORTE_SIMULACION = "2026-07-30"  # Fecha de prueba
-NAV_ACTUAL = 99040.40                  # NAV simulador
+COBERTURA_BAJISTA = "PSQ"     # Cobertura Activa Inversa (-1x QQQ)
 
 def obtener_tickers_sp500():
-    """Obtiene la lista actualizada de los componentes individuales del S&P 500."""
-    print("🔍 Cargando componentes del S&P 500...")
+    """Obtiene la lista actualizada de los componentes del S&P 500."""
+    print("🔍 Obteniendo componentes actualizados del S&P 500...")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -36,30 +24,33 @@ def obtener_tickers_sp500():
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         tabla = pd.read_html(response.text)[0]
-        tickers = tabla['Symbol'].str.replace('.', '-', regex=False).tolist()
-        print(f"✅ Se cargaron {len(tickers)} componentes.")
-        return tickers
-    except Exception as e:
-        print(f"⚠️ Error al cargar tickers del S&P 500: {e}. Se operará con universo sectorial y táctico.")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al acceder a la URL: {e}")
+        return []
+    except ValueError as e:
+        print(f"❌ Error al parsear la tabla HTML: {e}")
         return []
 
-# ==============================================================================
-# 2. DESCARGA DE DATOS HISTÓRICOS Y CORTE
-# ==============================================================================
-def obtener_datos_corte_historico(fecha_corte_str, dias_atras=365):
-    fecha_corte = datetime.datetime.strptime(fecha_corte_str, "%Y-%m-%d").date()
-    inicio = fecha_corte - datetime.timedelta(days=dias_atras)
-    fin_download = fecha_corte + datetime.timedelta(days=2)
+    tickers = tabla['Symbol'].str.replace('.', '-', regex=False).tolist()
+    print(f"✅ Se cargaron {len(tickers)} componentes del S&P 500.\n")
+    return tickers
 
+# ==============================================================================
+# 2. DESCARGA MASIVA DE DATOS DE MERCADO
+# ==============================================================================
+def obtener_datos_masivos(dias=365):
     tickers_sp500 = obtener_tickers_sp500()
     todos_los_tickers = list(set(
-        tickers_sp500 +
-        UNIVERSO_CORE_SECTORIAL +
-        UNIVERSO_SATELITE_ALTO_BETA +
-        [BENCHMARK, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
+        tickers_sp500 + [BENCHMARK, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
     ))
 
-    print(f"\n🔄 Descargando datos de mercado ({inicio} al {fecha_corte})...")
+    hoy = datetime.date.today()
+    fin_download = hoy + datetime.timedelta(days=1)
+    inicio = hoy - datetime.timedelta(days=dias)
+
+    print(f"🔄 Descargando precios de cierre históricos ({inicio} a {hoy})...")
+    print("⏱️ Esto puede demorar unos segundos debido al volumen de datos...")
+
     datos_raw = yf.download(
         todos_los_tickers, start=inicio, end=fin_download, auto_adjust=False, progress=True
     )
@@ -69,14 +60,22 @@ def obtener_datos_corte_historico(fecha_corte_str, dias_atras=365):
     else:
         precios = datos_raw
 
-    precios_filtrados = precios.loc[:pd.Timestamp(fecha_corte)].dropna(how="all", axis=1)
-    return precios_filtrados
+    # Elimina columnas sin datos suficientes (mantenemos mínimo 80% de datos cargados)
+    precios_limpios = precios.dropna(thresh=int(len(precios) * 0.8), axis=1)
+    return precios_limpios
 
 # ==============================================================================
-# 3. MÉTRICAS CUANTITATIVAS (EMA20, MOMENTUM, BETA Y EVALUACIÓN DE GATILLOS)
+# 3. ALGORITMOS CUANTITATIVOS Y MÉTRICAS ROBUSTAS (EMA20 Y GATILLOS)
 # ==============================================================================
+def calcular_momentum_agresivo(precios_df):
+    """Fórmula Acelerada: 70% Retorno 1 Mes (21d) + 30% Retorno 3 Meses (63d)."""
+    r_1m = precios_df.pct_change(21)
+    r_3m = precios_df.pct_change(63)
+    score = (0.70 * r_1m) + (0.30 * r_3m)
+    return score.iloc[-1]
+
 def verificar_tendencia_ema20_robusta(precios_ticker):
-    """Filtro Técnico Individual: Comprueba si P > EMA20 para activos individuales."""
+    """Filtro Técnico Individual: Comprueba si P > EMA20 limpiando NaNs."""
     s_limpia = precios_ticker.dropna()
     if len(s_limpia) < 20:
         return False, 0.0, 0.0
@@ -110,6 +109,7 @@ def evaluar_regimen_benchmark_spy(precios_spy):
 
     umbral_amplitud = 0.995 * ema_hoy  # P_SPY < 0.995 * EMA20 (-0.5%)
 
+    # Evaluación de cláusulas bajistas
     quiebre_amplitud = p_hoy < umbral_amplitud
     dos_cierres_debajo = (p_hoy < ema_hoy) and (p_ayer < ema_ayer)
 
@@ -125,15 +125,8 @@ def evaluar_regimen_benchmark_spy(precios_spy):
 
     return es_risk_on, p_hoy, ema_hoy, motivo
 
-def calcular_momentum_agresivo(precios_df):
-    """Fórmula: 70% Retorno 1 Mes (21d) + 30% Retorno 3 Meses (63d)."""
-    r_1m = precios_df.pct_change(21)
-    r_3m = precios_df.pct_change(63)
-    score = (0.70 * r_1m) + (0.30 * r_3m)
-    return score.iloc[-1]
-
 def calcular_betas_masivos(precios_df, benchmark_ticker="SPY", dias=252):
-    """Calcula el Coeficiente Beta de 1 año respecto al SPY."""
+    """Calcula el Beta rolling de 1 año respecto al SPY para todos los activos."""
     retornos = precios_df.pct_change().dropna().tail(dias)
     if benchmark_ticker not in retornos.columns:
         return pd.Series(1.0, index=precios_df.columns)
@@ -146,75 +139,76 @@ def calcular_betas_masivos(precios_df, benchmark_ticker="SPY", dias=252):
     return covarianzas / varianza_bm
 
 # ==============================================================================
-# 4. ESCÁNER TÁCTICO CON PROTOCOLO DEFENSIVO Y COBERTURA (CAPÍTULO 2 - EMA20)
+# 4. ESCÁNER GLOBAL Y REBALANCEO DE CARTERA (REGLAS CAPÍTULO 2 - EMA20)
 # ==============================================================================
-def diagnosticar_y_escanear_tactico(datos):
+def diagnosticar_y_escanear_sp500(datos):
     sp_risk_on, sp_precio, sp_ema, sp_motivo = evaluar_regimen_benchmark_spy(datos[BENCHMARK])
     fecha_evaluada = datos.index[-1].strftime("%Y-%m-%d")
 
     print("\n" + "=" * 80)
-    print(f"   ESCÁNER DE SELECCIÓN TÁCTICO CORE/SATÉLITE (EMA20) | FECHA CORTE: {fecha_evaluada}")
+    print("   ESCÁNER CUANTITATIVO REBALANCEO S&P 500 | SISTEMA EMA20")
     print("=" * 80)
-    print(f"Estado Benchmark ($SPY) -> Cierre: ${sp_precio:.2f} | EMA20: ${sp_ema:.2f}")
+    print(f"Fecha Evaluada: {fecha_evaluada}")
+    print(f"Estado SPY -> Cierre: ${sp_precio:.2f} | EMA20: ${sp_ema:.2f}")
     print(f"Diagnóstico de Régimen -> {sp_motivo}")
-    print("-" * 80)
 
     portafolio_objetivo = {}
 
-    # Excluir activos de control e instrumentos tácticos del cálculo general
+    # Excluir activos tácticos e instrumentos de control del cálculo general
     activos_excluidos = [BENCHMARK, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
-    tickers_evaluables = [col for col in datos.columns if col not in activos_excluidos]
+    tickers_elegibles = [col for col in datos.columns if col not in activos_excluidos]
+    precios_elegibles = datos[tickers_elegibles]
 
-    scores_momentum = calcular_momentum_agresivo(datos[tickers_evaluables])
+    # Cálculo masivo de métricas
+    scores_momentum = calcular_momentum_agresivo(precios_elegibles)
     betas = calcular_betas_masivos(datos, benchmark_ticker=BENCHMARK)
+
+    # Evaluación continua de empresas con P > EMA20
+    activos_tendencia = {}
+    for t in tickers_elegibles:
+        es_alcista, _, _ = verificar_tendencia_ema20_robusta(datos[t])
+        if es_alcista and not np.isnan(scores_momentum.get(t, np.nan)):
+            activos_tendencia[t] = scores_momentum[t]
+
+    print(f"\n📊 Total de empresas en el S&P 500 que cumplen la condición P > EMA20: {len(activos_tendencia)}")
+    print("-" * 80)
 
     # --------------------------------------------------------------------------
     # ESCENARIO A: MERCADO ALCISTA ($SPY > EMA20) - RISK-ON
     # --------------------------------------------------------------------------
     if sp_risk_on:
-        print("\n📈 EJECUTANDO MATRIZ RISK-ON (Estrategia de Expansión):")
-
-        # --- Módulo Core (75% NAV -> Top 3 Momentum con P > EMA20) ---
-        activos_core_alcistas = {}
-        universo_core = list(set(UNIVERSO_CORE_SECTORIAL + tickers_evaluables))
-        for t in universo_core:
-            if t in datos.columns:
-                es_alcista, _, _ = verificar_tendencia_ema20_robusta(datos[t])
-                if es_alcista and not np.isnan(scores_momentum.get(t, np.nan)):
-                    activos_core_alcistas[t] = scores_momentum[t]
-
-        ranking_core = sorted(activos_core_alcistas.items(), key=lambda x: x[1], reverse=True)
+        # --- MÓDULO CORE (75% Total -> Top 3 Momentum con P > EMA20) ---
+        ranking_core = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
         top_3_core = [t for t, _ in ranking_core[:3]]
 
-        print("\n🔹 MÓDULO CORE SELECCIONADO (75% NAV - Top 3 Momentum):")
+        print("\n🔥 MÓDULO CORE SELECCIONADO (75% NAV - Top 3 Momentum Alcistas):")
         for t in top_3_core:
             portafolio_objetivo[t] = 0.25
-            print(f" -> {t:6s} | Score Momentum: {scores_momentum[t]:7.4f} | Beta: {betas.get(t, 1.0):.2f} | Peso: 25.0%")
+            print(f" -> {t:6s} | Score Momentum: {scores_momentum[t]:7.4f} | Beta vs SPY: {betas.get(t, 1.0):.2f} | Peso: 25.0%")
 
+        # Relleno a cash/liquidez si en todo el S&P 500 hay menos de 3 acciones alcistas
         if len(top_3_core) < 3:
             faltantes = 3 - len(top_3_core)
             peso_refugio = faltantes * 0.25
             portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + peso_refugio
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Liquidez/Cash por falta de activos Core) | Peso: {peso_refugio*100:.1f}%")
+            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Falta de cuotas Core -> Liquidez) | Peso: {peso_refugio*100:.1f}%")
 
-        # --- Módulo Satélite (25% NAV -> Top 1 Alto Beta >= 1.20 con P > EMA20) ---
-        candidatos_satelite = {}
-        universo_satelite = list(set(UNIVERSO_SATELITE_ALTO_BETA + tickers_evaluables))
-        for t in universo_satelite:
-            if t in datos.columns:
-                es_alcista, _, _ = verificar_tendencia_ema20_robusta(datos[t])
-                beta_t = betas.get(t, 1.0)
-                if es_alcista and beta_t >= 1.20 and not np.isnan(scores_momentum.get(t, np.nan)):
-                    candidatos_satelite[t] = scores_momentum[t]
+        # --- MÓDULO SATÉLITE (25% Total -> Top 1 Alto Beta >= 1.20 + P > EMA20) ---
+        candidatos_cohetes = {}
+        for t, score in activos_tendencia.items():
+            beta_t = betas.get(t, 1.0)
+            if beta_t >= 1.20:
+                candidatos_cohetes[t] = (score, beta_t)
 
         print("\n🚀 MÓDULO SATÉLITE SELECCIONADO (25% NAV - Top 1 Cohete Alto Beta):")
-        if candidatos_satelite:
-            top_1_sat = max(candidatos_satelite, key=candidatos_satelite.get)
+        if candidatos_cohetes:
+            top_1_sat = max(candidatos_cohetes, key=lambda x: candidatos_cohetes[x][0])
+            score_win, beta_win = candidatos_cohetes[top_1_sat]
             portafolio_objetivo[top_1_sat] = 0.25
-            print(f" -> {top_1_sat:6s} | Score Momentum: {candidatos_satelite[top_1_sat]:7.4f} | Beta: {betas.get(top_1_sat, 1.0):.2f} | Peso: 25.0%")
+            print(f" -> {top_1_sat:6s} | Score Momentum: {score_win:7.4f} | Beta vs SPY: {beta_win:.2f} | Peso: 25.0%")
         else:
             portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + 0.25
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Liquidez/Cash por falta de activos Satélite) | Peso: 25.0%")
+            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Sin acciones Beta >= 1.2 en tendencia -> Liquidez) | Peso: 25.0%")
 
     # --------------------------------------------------------------------------
     # ESCENARIO B: MERCADO BAJISTA ($SPY < EMA20 / GATILLOS) - PROTOCOLO DEFENSIVO HÍBRIDO
@@ -222,51 +216,43 @@ def diagnosticar_y_escanear_tactico(datos):
     else:
         print("\n🛡️ EJECUTANDO PROTOCOLO DEFENSIVO HÍBRIDO (Estrategia Bajista - EMA20):")
 
-        # --- 1. Módulo Satélite (25% NAV) -> Rotación a Cobertura Activa ($PSQ) ---
+        # --- MÓDULO SATÉLITE (25% NAV) -> Rotación a Cobertura Activa ($PSQ) ---
         portafolio_objetivo[COBERTURA_BAJISTA] = 0.25
         print(f"\n⚡ MÓDULO SATÉLITE (25% NAV - Cobertura Activa Inversa):")
-        print(f" -> {COBERTURA_BAJISTA:6s} | Motor de Alfa Bajista (Inverse -1x QQQ) | Peso: 25.0%")
+        print(f" -> {COBERTURA_BAJISTA:6s} | Alfa Bajista (Inverse -1x QQQ) | Peso: 25.0%")
 
-        # --- 2. Módulo Core (75% NAV) -> Refugio Sectorial Resiliente vs Renta Fija / Cash ---
-        sectores_resilientes = {}
-        for t in UNIVERSO_CORE_SECTORIAL:
-            if t in datos.columns:
-                es_alcista, _, _ = verificar_tendencia_ema20_robusta(datos[t])
-                if es_alcista and not np.isnan(scores_momentum.get(t, np.nan)):
-                    sectores_resilientes[t] = scores_momentum[t]
+        # --- MÓDULO CORE (75% NAV) -> Acciones Resilientes vs Renta Fija / Cash ---
+        ranking_core = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
 
-        print(f"\n🛡️ MÓDULO CORE (75% NAV - Refugio Sectorial / Preservación):")
-
-        # REGLA TESIS: Si existen sectores/activos resilientes con P > EMA20:
-        if sectores_resilientes:
-            ranking_resiliente = sorted(sectores_resilientes.items(), key=lambda x: x[1], reverse=True)
-            top_2_resilientes = [t for t, _ in ranking_resiliente[:2]]
-            peso_por_sector = 0.25 / len(top_2_resilientes)
+        print(f"\n🛡️ MÓDULO CORE (75% NAV - Resiliencia / Renta Fija / Cash):")
+        if ranking_core:
+            # Asignación máxima de 25% combinado a las Top 2 acciones que sostienen P > EMA20
+            top_2_resilientes = [t for t, _ in ranking_core[:2]]
+            peso_por_activo = 0.25 / len(top_2_resilientes)
 
             for t in top_2_resilientes:
-                portafolio_objetivo[t] = peso_por_sector
-                print(f" -> {t:6s} | Sector Resiliente (P > EMA20) | Score: {sectores_resilientes[t]:7.4f} | Peso: {peso_por_sector*100:.1f}%")
+                portafolio_objetivo[t] = peso_por_activo
+                print(f" -> {t:6s} | Resiliente (P > EMA20) | Score: {scores_momentum[t]:7.4f} | Peso: {peso_por_activo*100:.1f}%")
 
             # Asignación del 50% a Renta Fija Refugio ($SHY - Treasuries 1-3 Años)
-            peso_rf_shy = 0.50
-            portafolio_objetivo[REFUGIO_RENTA_FIJA] = peso_rf_shy
-            print(f" -> {REFUGIO_RENTA_FIJA:6s} | Refugio Renta Fija (Treasuries 1-3 años) | Peso: {peso_rf_shy*100:.1f}%")
-
-        # REGLA TESIS DE PRESERVACIÓN ABSOLUTA: Si ningún activo supera la EMA20 (Pánico Sistémico):
+            peso_rf = 0.50
+            portafolio_objetivo[REFUGIO_RENTA_FIJA] = peso_rf
+            print(f" -> {REFUGIO_RENTA_FIJA:6s} | Refugio Renta Fija (Treasuries 1-3 años) | Peso: {peso_rf*100:.1f}%")
         else:
-            peso_liquidez_bil = 0.75
-            portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = peso_liquidez_bil
+            # Pánico Sistémico: 100% del Módulo Core (75% NAV) a Liquidez/Cash ($BIL)
+            peso_liquidez_core = 0.75
+            portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = peso_liquidez_core
             print(f" ⚠️ PÁNICO SISTÉMICO: Ningún activo sostiene P > EMA20.")
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} | Preservación Absoluta (100% Core/Refugio a Cash/BIL) | Peso: {peso_liquidez_bil*100:.1f}%")
+            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} | Preservación Absoluta: 100% Core a Cash ($BIL) | Peso: {peso_liquidez_core*100:.1f}%")
 
     return portafolio_objetivo, datos.iloc[-1]
 
 # ==============================================================================
-# 5. CÁLCULO DE ÓRDENES Y CAPITAL
+# 5. GENERACIÓN DE ÓRDENES Y CÁLCULO DE CAPITAL
 # ==============================================================================
 def calcular_instrucciones(portafolio_objetivo, precios_actuales, nav_actual):
     print("\n" + "=" * 80)
-    print(f"  ÓRDENES DE REBALANCEO | NAV SIMULADOR: ${nav_actual:,.2f} USD")
+    print(f"  ÓRDENES DE REBALANCEO | NAV ACTUAL EN SIMULADOR: ${nav_actual:,.2f} USD")
     print("=" * 80)
 
     resumen = []
@@ -285,32 +271,6 @@ def calcular_instrucciones(portafolio_objetivo, precios_actuales, nav_actual):
 
         funcao = "Cobertura Inversa" if ticker == COBERTURA_BAJISTA else (
             "Renta Fija Refugio" if ticker == REFUGIO_RENTA_FIJA else (
-                "Cash / Liquidez" if ticker == REFUGIO_CASH_LIQUIDEZ else "Renta Variable"
+                "Cash / Liquidez" if ticker == REFUGIO_CASH_LIQUIDEZ else "Acción RV"
             )
         )
-
-        resumen.append(
-            {
-                "Ticker": ticker,
-                "Función Táctica": funcao,
-                "Peso Target": f"{peso * 100:.1f}%",
-                "Monto Target": f"${capital_target:,.2f}",
-                "Precio Cierre": f"${precio:.2f}",
-                "Acciones Objetivo": acciones,
-                "Stop-Loss (-5%)": stop_loss_str,
-            }
-        )
-
-    df = pd.DataFrame(resumen)
-    print(df.to_string(index=False))
-    print("-" * 80)
-    print(f"Suma Total de Pesos Asignados: {total_peso * 100:.1f}%")
-    print("=" * 80)
-
-# ==============================================================================
-# 6. EJECUCIÓN
-# ==============================================================================
-if __name__ == "__main__":
-    datos_mercado = obtener_datos_corte_historico(FECHA_CORTE_SIMULACION)
-    target_portfolio, ultimos_precios = diagnosticar_y_escanear_tactico(datos_mercado)
-    calcular_instrucciones(target_portfolio, ultimos_precios, nav_actual=NAV_ACTUAL)
