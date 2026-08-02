@@ -33,5 +33,4 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 │   ├── 02_rebalanceo_extraordinario.py       <-- Script de rebalanceo por evento (event-driven)
 │   └── 03_rebalanceo_quincenal.py            <-- Algoritmo de selección y ranking Momentum/Beta
 │
-└── config/                                   <-- Archivos de configuración
-    └── portafolio_actual.json                <-- Registro de posiciones vigentes en cartera
+└── 
