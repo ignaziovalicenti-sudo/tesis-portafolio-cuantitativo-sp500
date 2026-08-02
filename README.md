@@ -28,9 +28,9 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 ├── requirements.txt             <-- Librerías de Python requeridas
 │
 ├── src/                         <-- Código fuente del modelo
-│   ├── rebalanceo_quincenal.py  <-- Algoritmo de selección y ranking Momentum/Beta
-│   ├── monitoreo_diario.py      <-- Script de rebalanceo extraordinario (event-driven)
-│   └── generador_diagramas.py   <-- Script para generar los diagramas de flujo de la tesis
+│   ├── 01_Monitore_Regimen_Mercado.py  <-- Monitoreo Risk-On / Risk-Off
+│   ├── 02_Rebalanceo Diario por Evento ( Extra-Temporal.py      <-- Script de rebalanceo extraordinario (event-driven)
+│   └── 03_Rebalanceo_quincenal.py   <-- Algoritmo de selección y ranking Momentum/Beta
 │
 └── config/                      <-- Archivos de configuración
     └── portafolio_actual.json   <-- Registro de posiciones vigentes en cartera
