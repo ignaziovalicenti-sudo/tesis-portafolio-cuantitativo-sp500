@@ -29,7 +29,7 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 │
 ├── src/                         <-- Código fuente del modelo
 │   ├── 01_Monitore_Regimen_Mercado.py  <-- Monitoreo Risk-On / Risk-Off
-│   ├── 02_Rebalanceo Diario por Evento ( Extra-Temporal.py      <-- Script de rebalanceo extraordinario (event-driven)
+│   ├── 02_Rebalanceo Diario por Evento Extra-Temporal.py <-- Script de rebalanceo extraordinario (event-driven)
 │   └── 03_Rebalanceo_quincenal.py   <-- Algoritmo de selección y ranking Momentum/Beta
 │
 └── config/                      <-- Archivos de configuración
