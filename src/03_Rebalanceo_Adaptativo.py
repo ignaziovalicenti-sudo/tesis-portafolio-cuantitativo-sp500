@@ -12,6 +12,16 @@ REFUGIO_RENTA_FIJA = "SHY"    # Treasuries 1-3 Años (Preservación Táctica - 5
 REFUGIO_CASH_LIQUIDEZ = "BIL" # Treasuries 1-3 Meses / Cash (Preservación Absoluta / Pánico)
 COBERTURA_BAJISTA = "PSQ"     # Cobertura Activa Inversa (-1x QQQ)
 
+# UMBRAL DE TOLERANCIA / ROTACIÓN MÍNIMA PARA EVITAR FRICCIÓN
+UMBRAL_ROTACION_MINIMA = 0.05 # Requiere +0.05 de ventaja en Score para justificar cambio
+
+# PORTAFOLIO VIGENTE EN CARTERA (Ejemplo de Estado Previo)
+# Dejar vacío {} si es la primera compra o rebalanceo inicial sin posiciones
+PORTAFOLIO_ACTUAL = {
+    "CORE": ["DELL", "HPE", "BAX"],
+    "SATELITE": "NTAP"
+}
+
 def obtener_tickers_sp500():
     """Obtiene la lista actualizada de los componentes del S&P 500."""
     print("🔍 Obteniendo componentes actualizados del S&P 500...")
@@ -100,10 +110,10 @@ def evaluar_regimen_benchmark_spy(precios_spy):
         return False, 0.0, 0.0, "Datos insuficientes"
 
     ema_20 = s_limpia.ewm(span=20, adjust=False).mean()
-    
+
     p_hoy = float(s_limpia.iloc[-1])
     ema_hoy = float(ema_20.iloc[-1])
-    
+
     p_ayer = float(s_limpia.iloc[-2])
     ema_ayer = float(ema_20.iloc[-2])
 
@@ -141,7 +151,7 @@ def calcular_betas_masivos(precios_df, benchmark_ticker="SPY", dias=252):
 # ==============================================================================
 # 4. ESCÁNER GLOBAL Y REBALANCEO DE CARTERA (REGLAS CAPÍTULO 2 - EMA20)
 # ==============================================================================
-def diagnosticar_y_escanear_sp500(datos):
+def diagnosticar_y_escanear_sp500(datos, portafolio_actual=None):
     sp_risk_on, sp_precio, sp_ema, sp_motivo = evaluar_regimen_benchmark_spy(datos[BENCHMARK])
     fecha_evaluada = datos.index[-1].strftime("%Y-%m-%d")
 
@@ -177,9 +187,45 @@ def diagnosticar_y_escanear_sp500(datos):
     # ESCENARIO A: MERCADO ALCISTA ($SPY > EMA20) - RISK-ON
     # --------------------------------------------------------------------------
     if sp_risk_on:
-        # --- MÓDULO CORE (75% Total -> Top 3 Momentum con P > EMA20) ---
-        ranking_core = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
-        top_3_core = [t for t, _ in ranking_core[:3]]
+        # Ranking teórico ideal en tendencia alcista
+        ranking_core_teorico = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
+        top_3_teorico = [t for t, _ in ranking_core_teorico[:3]]
+
+        # --- APLICACIÓN DE FILTRO DE TOLERANCIA / ROTACIÓN MÍNIMA EN CORE ---
+        top_3_core = []
+        if portafolio_actual and "CORE" in portafolio_actual and len(portafolio_actual["CORE"]) > 0:
+            core_vigente = portafolio_actual["CORE"]
+            print("\n⚙️ EVALUANDO FILTRO DE TOLERANCIA Y ROTACIÓN MÍNIMA (Core Vigente):")
+
+            for t_actual in core_vigente:
+                # Si el activo actual sigue en tendencia alcista P > EMA20
+                if t_actual in activos_tendencia:
+                    score_actual = activos_tendencia[t_actual]
+                    # Buscar el mejor candidato externo que aún no esté en el nuevo core
+                    candidatos = [t for t in top_3_teorico if t not in top_3_core and t != t_actual]
+
+                    if candidatos:
+                        mejor_candidato = candidatos[0]
+                        score_candidato = activos_tendencia[mejor_candidato]
+                        diff = score_candidato - score_actual
+
+                        if diff > UMBRAL_ROTACION_MINIMA:
+                            print(f" 🔄 REEMPLAZO JUSTIFICADO: {mejor_candidato} (Score: {score_candidato:.4f}) supera a {t_actual} (Score: {score_actual:.4f}) por +{diff:.4f} > {UMBRAL_ROTACION_MINIMA}")
+                            top_3_core.append(mejor_candidato)
+                        else:
+                            print(f" ✋ MANTENER POSICIÓN: {t_actual} (Score: {score_actual:.4f}) se retiene vs {mejor_candidato} (Diff: +{diff:.4f} <= {UMBRAL_ROTACION_MINIMA})")
+                            top_3_core.append(t_actual)
+                    else:
+                        top_3_core.append(t_actual)
+                else:
+                    print(f" ❌ VENTA REQUERIDA: {t_actual} perdió P > EMA20. Se sustituye por candidato ideal.")
+
+            # Completar cupos si hicieron falta reemplazos directos
+            for t_cand in top_3_teorico:
+                if len(top_3_core) < 3 and t_cand not in top_3_core:
+                    top_3_core.append(t_cand)
+        else:
+            top_3_core = top_3_teorico
 
         print("\n🔥 MÓDULO CORE SELECCIONADO (75% NAV - Top 3 Momentum Alcistas):")
         for t in top_3_core:
@@ -193,22 +239,38 @@ def diagnosticar_y_escanear_sp500(datos):
             portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + peso_refugio
             print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Falta de cuotas Core -> Liquidez) | Peso: {peso_refugio*100:.1f}%")
 
-        # --- MÓDULO SATÉLITE (25% Total -> Top 1 Alto Beta >= 1.20 + P > EMA20) ---
+        # --- MÓDULO SATÉLITE (25% Total -> Top 1 Alto Beta >= 1.20 EXCLUYENDO EL CORE) ---
         candidatos_cohetes = {}
         for t, score in activos_tendencia.items():
-            beta_t = betas.get(t, 1.0)
-            if beta_t >= 1.20:
-                candidatos_cohetes[t] = (score, beta_t)
+            if t not in top_3_core:
+                beta_t = betas.get(t, 1.0)
+                if beta_t >= 1.20:
+                    candidatos_cohetes[t] = (score, beta_t)
 
-        print("\n🚀 MÓDULO SATÉLITE SELECCIONADO (25% NAV - Top 1 Cohete Alto Beta):")
+        print("\n🚀 MÓDULO SATÉLITE SELECCIONADO (25% NAV - Top 1 Cohete Alto Beta Exclusivo):")
         if candidatos_cohetes:
-            top_1_sat = max(candidatos_cohetes, key=lambda x: candidatos_cohetes[x][0])
+            top_1_sat_teorico = max(candidatos_cohetes, key=lambda x: candidatos_cohetes[x][0])
+            score_win_teorico, beta_win_teorico = candidatos_cohetes[top_1_sat_teorico]
+
+            # Tolerancia en Satélite
+            top_1_sat = top_1_sat_teorico
+            if portafolio_actual and "SATELITE" in portafolio_actual and portafolio_actual["SATELITE"]:
+                sat_actual = portafolio_actual["SATELITE"]
+                if sat_actual in candidatos_cohetes and sat_actual not in top_3_core:
+                    score_actual = candidatos_cohetes[sat_actual][0]
+                    diff_sat = score_win_teorico - score_actual
+                    if diff_sat <= UMBRAL_ROTACION_MINIMA:
+                        print(f" ✋ MANTENER SATÉLITE: {sat_actual} (Score: {score_actual:.4f}) se retiene vs {top_1_sat_teorico} (Diff: +{diff_sat:.4f} <= {UMBRAL_ROTACION_MINIMA})")
+                        top_1_sat = sat_actual
+                    else:
+                        print(f" 🔄 ROTACIÓN SATÉLITE: {top_1_sat_teorico} supera a {sat_actual} por +{diff_sat:.4f} > {UMBRAL_ROTACION_MINIMA}")
+
             score_win, beta_win = candidatos_cohetes[top_1_sat]
             portafolio_objetivo[top_1_sat] = 0.25
             print(f" -> {top_1_sat:6s} | Score Momentum: {score_win:7.4f} | Beta vs SPY: {beta_win:.2f} | Peso: 25.0%")
         else:
             portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + 0.25
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Sin acciones Beta >= 1.2 en tendencia -> Liquidez) | Peso: 25.0%")
+            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Sin acciones Beta >= 1.2 en tendencia fuera del Core -> Liquidez) | Peso: 25.0%")
 
     # --------------------------------------------------------------------------
     # ESCENARIO B: MERCADO BAJISTA ($SPY < EMA20 / GATILLOS) - PROTOCOLO DEFENSIVO HÍBRIDO
@@ -226,7 +288,6 @@ def diagnosticar_y_escanear_sp500(datos):
 
         print(f"\n🛡️ MÓDULO CORE (75% NAV - Resiliencia / Renta Fija / Cash):")
         if ranking_core:
-            # Asignación máxima de 25% combinado a las Top 2 acciones que sostienen P > EMA20
             top_2_resilientes = [t for t, _ in ranking_core[:2]]
             peso_por_activo = 0.25 / len(top_2_resilientes)
 
@@ -234,12 +295,10 @@ def diagnosticar_y_escanear_sp500(datos):
                 portafolio_objetivo[t] = peso_por_activo
                 print(f" -> {t:6s} | Resiliente (P > EMA20) | Score: {scores_momentum[t]:7.4f} | Peso: {peso_por_activo*100:.1f}%")
 
-            # Asignación del 50% a Renta Fija Refugio ($SHY - Treasuries 1-3 Años)
             peso_rf = 0.50
             portafolio_objetivo[REFUGIO_RENTA_FIJA] = peso_rf
             print(f" -> {REFUGIO_RENTA_FIJA:6s} | Refugio Renta Fija (Treasuries 1-3 años) | Peso: {peso_rf*100:.1f}%")
         else:
-            # Pánico Sistémico: 100% del Módulo Core (75% NAV) a Liquidez/Cash ($BIL)
             peso_liquidez_core = 0.75
             portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = peso_liquidez_core
             print(f" ⚠️ PÁNICO SISTÉMICO: Ningún activo sostiene P > EMA20.")
@@ -273,4 +332,34 @@ def calcular_instrucciones(portafolio_objetivo, precios_actuales, nav_actual):
             "Renta Fija Refugio" if ticker == REFUGIO_RENTA_FIJA else (
                 "Cash / Liquidez" if ticker == REFUGIO_CASH_LIQUIDEZ else "Acción RV"
             )
+        )
+
+        resumen.append(
+            {
+                "Ticker": ticker,
+                "Función": funcao,
+                "Peso Target": f"{peso * 100:.1f}%",
+                "Monto Target": f"${capital_target:,.2f}",
+                "Precio Cierre": f"${precio:.2f}",
+                "Acciones Objetivo": acciones,
+                "Stop-Loss (-5%)": stop_loss_str,
+            }
+        )
+
+    df = pd.DataFrame(resumen)
+    print(df.to_string(index=False))
+    print("-" * 80)
+    print(f"Suma Total de Pesos Asignados: {total_peso * 100:.1f}%")
+    print("=" * 80)
+    return df
+
+# ==============================================================================
+# 6. EJECUCIÓN
+# ==============================================================================
+if __name__ == "__main__":
+    NAV_FLOTANTE_ACTUAL = 98196.64
+
+    datos_mercado = obtener_datos_masivos()
+    target_portfolio, ultimos_precios = diagnosticar_y_escanear_sp500(datos_mercado, portafolio_actual=PORTAFOLIO_ACTUAL)
+    reporte_df = calcular_instrucciones(target_portfolio, ultimos_precios, nav_actual=NAV_FLOTANTE_ACTUAL)
         )
