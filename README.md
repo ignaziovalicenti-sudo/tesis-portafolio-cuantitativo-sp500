@@ -29,8 +29,8 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 ├── requirements.txt                          <-- Librerías de Python requeridas
 │
 ├── src/                                      <-- Código fuente del modelo
-│   ├── 01_monitoreo_regimen_mercado.py       <-- Monitoreo de régimen (Risk-On / Risk-Off)
-│   ├── 02_rebalanceo_extraordinario.py       <-- Script de rebalanceo por evento (event-driven)
-│   └── 03_rebalanceo_quincenal.py            <-- Algoritmo de selección y ranking Momentum/Beta
+│   ├── 01_monitoreo_regimen_mercado.py       <-- Evaluador diario del Benchmark (SPY vs EMA20)
+│   ├── 02_monitor_salud_posiciones.py        <-- Evaluación diario de posiciones individuales (P < EMA2)
+│   └── 03_rebalanceo_adaptativo.py           <-- Motor de ordenes (Ejecución programada y cambio de regimen)
 │
 └── 
