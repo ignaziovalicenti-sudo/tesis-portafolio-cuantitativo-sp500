@@ -1,365 +1,434 @@
-import datetime
-import pandas as pd
-import yfinance as yf
+#Script 0
+pip install scipy
+
+#Script 1
+import datetime as dt
+import json
+import logging
+from io import StringIO
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import requests
+import yfinance as yf
+from scipy.stats import linregress
+from tqdm import tqdm
 
-# ==============================================================================
-# 1. DEFINICIÓN DE PARÁMETROS Y OBTENCIÓN DINÁMICA DEL UNIVERSO S&P 500
-# ==============================================================================
-BENCHMARK = "SPY"
-REFUGIO_RENTA_FIJA = "SHY"    # Treasuries 1-3 Años (Preservación Táctica - 50% en Risk-Off)
-REFUGIO_CASH_LIQUIDEZ = "BIL" # Treasuries 1-3 Meses / Cash (Preservación Absoluta / Pánico)
-COBERTURA_BAJISTA = "PSQ"     # Cobertura Activa Inversa (-1x QQQ)
+# ============================== CONFIGURACION ==============================
+FILTRO_MACRO = "SPY"
+BENCHMARK_MOMENTUM = "SPMO"
+REFUGIO_RENTA_FIJA = "SHY"
+REFUGIO_CASH_LIQUIDEZ = "BIL"
+COBERTURA_BAJISTA = "SH"
 
-# UMBRAL DE TOLERANCIA / ROTACIÓN MÍNIMA PARA EVITAR FRICCIÓN
-UMBRAL_ROTACION_MINIMA = 0.05 # Requiere +0.05 de ventaja en Score para justificar cambio
+ETFS_SATELITE = [
+    "SPHB",
+    "QQQ", "QQQM", "VGT", "XLK", "IYW", "SMH", "SOXX", "XSD",
+    "VUG", "IWF", "SCHG",
+    "IWM", "IJR", "VB",
+    "XLY", "XLC", "XLI", "XLF", "XLE", "XME",
+    "IGV", "SKYY", "CLOU", "BOTZ", "ROBO", "ARKK",
+]
 
-# PORTAFOLIO VIGENTE EN CARTERA (Ejemplo de Estado Previo)
-# Dejar vacío {} si es la primera compra o rebalanceo inicial sin posiciones
-PORTAFOLIO_ACTUAL = {
-    "CORE": ["DELL", "HPE", "BAX"],
-    "SATELITE": "NTAP"
+VENTANA_EMA_MACRO = 30
+BANDA_TOLERANCIA_EMA = 0.985
+PRESUPUESTO_CORE = 0.75
+PRESUPUESTO_SATELITE = 0.25
+
+VENTANA_BETA = 126
+BETA_MINIMA_SATELITE = 1.10
+VENTANA_R2 = 60
+R2_MINIMO = 0.45
+MAX_DISTANCIA_EMA_PCT = 0.10
+CERCANIA_MAXIMO_PCT = 0.96
+DOLLAR_VOLUME_MINIMO = 20_000_000
+DIAS_BLACKOUT_BALANCE = 30
+
+STOP_LOSS_INICIAL_PCT = 0.05
+UMBRAL_BREAKEVEN_PCT = 0.025
+BUFFER_BREAKEVEN_PCT = 0.005
+TRAILING_STOP_MAX_PCT = 0.04
+
+TICKERS_BLACKLIST = {
+    "SNDK", "TECH", "CNC", "TMUS", "SYY", "INVH", "WELL", "HUM", "SBUX", "EW"
 }
+ARCHIVO_ESTADO = Path("estado_momentum.json")
 
-def obtener_tickers_sp500():
-    """Obtiene la lista actualizada de los componentes del S&P 500."""
-    print("🔍 Obteniendo componentes actualizados del S&P 500...")
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+
+# ============================== ESTADO DEL STOP ==============================
+def cargar_estado(path=ARCHIVO_ESTADO):
+    if not path.exists():
+        return {"maximos_desde_entrada": {}}
     try:
-        response = requests.get(url, headers=headers)
+        with path.open("r", encoding="utf-8") as f:
+            estado = json.load(f)
+        estado.setdefault("maximos_desde_entrada", {})
+        return estado
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("No se pudo leer el estado: %s", exc)
+        return {"maximos_desde_entrada": {}}
+
+
+def guardar_estado(estado, path=ARCHIVO_ESTADO):
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(estado, f, indent=2, ensure_ascii=False)
+    tmp.replace(path)
+
+
+# ============================== DATOS ==============================
+def obtener_universo_sp500():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MomentumScanner/3.0)"}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
-        tabla = pd.read_html(response.text)[0]
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error al acceder a la URL: {e}")
-        return []
-    except ValueError as e:
-        print(f"❌ Error al parsear la tabla HTML: {e}")
-        return []
+        tabla = pd.read_html(StringIO(response.text), match="Symbol")[0]
+        tickers = tabla["Symbol"].astype(str).str.replace(".", "-", regex=False)
+        sectores = tabla["GICS Sector"].astype(str)
+        return dict(zip(tickers, sectores))
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo obtener el S&P 500: {exc}") from exc
 
-    tickers = tabla['Symbol'].str.replace('.', '-', regex=False).tolist()
-    print(f"✅ Se cargaron {len(tickers)} componentes del S&P 500.\n")
-    return tickers
 
-# ==============================================================================
-# 2. DESCARGA MASIVA DE DATOS DE MERCADO
-# ==============================================================================
-def obtener_datos_masivos(dias=365):
-    tickers_sp500 = obtener_tickers_sp500()
-    todos_los_tickers = list(set(
-        tickers_sp500 + [BENCHMARK, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
-    ))
+def extraer_campo(datos, campo):
+    if not isinstance(datos.columns, pd.MultiIndex):
+        if campo not in datos.columns:
+            raise KeyError(f"Falta {campo}")
+        return datos[[campo]].copy()
+    if campo not in datos.columns.get_level_values(0):
+        raise KeyError(f"Falta {campo}")
+    df = datos[campo].copy()
+    return df.to_frame() if isinstance(df, pd.Series) else df
 
-    hoy = datetime.date.today()
-    fin_download = hoy + datetime.timedelta(days=1)
-    inicio = hoy - datetime.timedelta(days=dias)
 
-    print(f"🔄 Descargando precios de cierre históricos ({inicio} a {hoy})...")
-    print("⏱️ Esto puede demorar unos segundos debido al volumen de datos...")
+def obtener_datos_masivos(dias_calendario=500, tickers_extra=None):
+    mapa = obtener_universo_sp500()
+    extras = tickers_extra or []
+    vitales = [FILTRO_MACRO, BENCHMARK_MOMENTUM, REFUGIO_RENTA_FIJA,
+               REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
+    tickers = list(dict.fromkeys(list(mapa) + ETFS_SATELITE + extras + vitales))
+    tickers = [t for t in tickers if "." not in t]
 
-    datos_raw = yf.download(
-        todos_los_tickers, start=inicio, end=fin_download, auto_adjust=False, progress=True
+    hoy = dt.date.today()
+    datos = yf.download(
+        tickers=tickers,
+        start=hoy - dt.timedelta(days=dias_calendario),
+        end=hoy + dt.timedelta(days=1),
+        auto_adjust=True,
+        group_by="column",
+        multi_level_index=True,
+        threads=True,
+        progress=True, # Changed from False to True
+        repair=True,
+        timeout=30,
     )
+    if datos is None or datos.empty:
+        raise RuntimeError("Yahoo Finance no devolvio datos")
 
-    if "Close" in datos_raw:
-        precios = datos_raw["Close"]
+    cierre = extraer_campo(datos, "Close").sort_index()
+    maximo = extraer_campo(datos, "High").reindex_like(cierre)
+    minimo = extraer_campo(datos, "Low").reindex_like(cierre)
+    volumen = extraer_campo(datos, "Volume").reindex_like(cierre)
+
+    validos = cierre.tail(20).dropna(axis=1, thresh=18).columns
+    dollar_volume = (cierre[validos] * volumen[validos]).tail(20).median()
+    liquidos = set(dollar_volume[dollar_volume >= DOLLAR_VOLUME_MINIMO].index)
+    finales = [t for t in cierre.columns if t in liquidos]
+
+    # Los vitales, ETFs satelite y posiciones actuales se conservan si tienen datos.
+    for ticker in vitales + ETFS_SATELITE + extras:
+        if ticker in cierre.columns and ticker not in finales and cierre[ticker].notna().any():
+            finales.append(ticker)
+
+    if FILTRO_MACRO not in finales:
+        raise RuntimeError("No hay datos utilizables para SPY")
+    return cierre[finales], maximo[finales], minimo[finales], volumen[finales], mapa
+
+
+# ============================== INDICADORES ==============================
+def calcular_momentum_suavizado(precios):
+    return (0.60 * precios.pct_change(21, fill_method=None)
+            + 0.30 * precios.pct_change(63, fill_method=None)
+            + 0.10 * precios.pct_change(126, fill_method=None))
+
+
+def calcular_r2_log(serie):
+    serie = serie.dropna().tail(VENTANA_R2)
+    if len(serie) < VENTANA_R2 or (serie <= 0).any():
+        return np.nan, np.nan
+    x = np.arange(len(serie), dtype=float)
+    pendiente, _, r, _, _ = linregress(x, np.log(serie.to_numpy(dtype=float)))
+    return float(r ** 2), float(pendiente)
+
+
+def calcular_beta(precios_activo, precios_spy, ventana=VENTANA_BETA):
+    retornos = pd.concat([
+        precios_activo.pct_change(fill_method=None).rename("activo"),
+        precios_spy.pct_change(fill_method=None).rename("spy"),
+    ], axis=1, join="inner").dropna().tail(ventana)
+    if len(retornos) < ventana:
+        return np.nan
+    var_spy = float(retornos["spy"].var(ddof=1))
+    if not np.isfinite(var_spy) or var_spy <= 0:
+        return np.nan
+    return float(retornos["activo"].cov(retornos["spy"]) / var_spy)
+
+
+def evaluar_regimen_macro(spy):
+    s = spy.dropna()
+    if len(s) < VENTANA_EMA_MACRO + 2:
+        raise ValueError("Historial insuficiente para SPY")
+    ema = s.ewm(span=VENTANA_EMA_MACRO, adjust=False).mean()
+    p0, p1 = float(s.iloc[-1]), float(s.iloc[-2])
+    e0, e1 = float(ema.iloc[-1]), float(ema.iloc[-2])
+    risk_off = p0 < BANDA_TOLERANCIA_EMA * e0 or (p0 < e0 and p1 < e1)
+    motivo = "RISK-OFF confirmado" if risk_off else "RISK-ON / sin confirmacion bajista"
+    return not risk_off, p0, e0, motivo
+
+
+def pesos_iguales(tickers, presupuesto):
+    return {} if not tickers else {t: presupuesto / len(tickers) for t in tickers}
+
+def calcular_atr(cierre, maximo, minimo, ventana=14):
+    """Calcula el Average True Range (ATR) de una serie de precios."""
+    tr1 = maximo - minimo
+    tr2 = (maximo - cierre.shift(1)).abs()
+    tr3 = (minimo - cierre.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=ventana).mean()
+
+
+# ============================== EARNINGS ==============================
+def balance_inminente(ticker, dias_peligro=30):
+    if ticker in set(ETFS_SATELITE) | {FILTRO_MACRO, BENCHMARK_MOMENTUM,
+                                      REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ,
+                                      COBERTURA_BAJISTA}:
+        return False
+    try:
+        cal = yf.Ticker(ticker).calendar
+        fechas = cal.get("Earnings Date", []) if isinstance(cal, dict) else []
+        if not isinstance(fechas, (list, tuple, pd.Series, np.ndarray)):
+            fechas = [fechas]
+        hoy = dt.date.today()
+        return any(0 <= (pd.Timestamp(f).date() - hoy).days <= dias_peligro
+                   for f in fechas if pd.notna(f))
+    except Exception as exc:
+        logger.warning("No se pudo verificar earnings de %s: %s", ticker, exc)
+        return False
+
+
+# ============================== ESCANER ==============================
+def diagnosticar_y_escanear_universo(cierre, maximo, minimo, volumen, mapa):
+    del minimo, volumen
+    risk_on, p_spy, ema_spy, motivo = evaluar_regimen_macro(cierre[FILTRO_MACRO])
+    print("\n" + "=" * 95)
+    print(f"REGIMEN: {motivo} | SPY: ${p_spy:.2f} | EMA30: ${ema_spy:.2f}")
+    print("=" * 95)
+
+    excluidos = {FILTRO_MACRO, BENCHMARK_MOMENTUM, REFUGIO_RENTA_FIJA,
+                 REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA}
+    elegibles = [t for t in cierre.columns if t not in excluidos]
+    momentum = calcular_momentum_suavizado(cierre[elegibles]).iloc[-1]
+    aprobados, r2_map = {}, {}
+
+    for ticker in tqdm(elegibles, desc="Escaneando", unit="ticker"):
+        if ticker in TICKERS_BLACKLIST:
+            continue
+        s, h = cierre[ticker].dropna(), maximo[ticker].dropna()
+        if len(s) < 127 or len(h) < 20:
+            continue
+        p = float(s.iloc[-1])
+        ema10 = s.ewm(span=10, adjust=False).mean()
+        ema30 = s.ewm(span=VENTANA_EMA_MACRO, adjust=False).mean()
+        e10, e30 = float(ema10.iloc[-1]), float(ema30.iloc[-1])
+        r2, pend = calcular_r2_log(s)
+        mom = float(momentum.get(ticker, np.nan))
+        condiciones = [
+            p >= BANDA_TOLERANCIA_EMA * e30,
+            p / e30 - 1 <= MAX_DISTANCIA_EMA_PCT,
+            p > e10, e10 > e30,
+            e10 > float(ema10.iloc[-4]), e30 > float(ema30.iloc[-6]),
+            p >= CERCANIA_MAXIMO_PCT * float(h.tail(20).max()),
+            float(s.pct_change(21, fill_method=None).iloc[-1]) > 0,
+            np.isfinite(r2) and r2 >= R2_MINIMO,
+            np.isfinite(pend) and pend > 0,
+            np.isfinite(mom),
+        ]
+        if all(condiciones):
+            aprobados[ticker], r2_map[ticker] = mom, r2
+
+    if not risk_on:
+        objetivo = {COBERTURA_BAJISTA: 0.25, REFUGIO_RENTA_FIJA: 0.50,
+                    REFUGIO_CASH_LIQUIDEZ: 0.25}
+        print("PROTOCOLO DEFENSIVO: 25% SH / 50% SHY / 25% BIL")
+        return risk_on, objetivo
+
+    ranking = sorted(aprobados, key=aprobados.get, reverse=True)
+
+    core, sectores = [], set()
+    for ticker in ranking:
+        if ticker in ETFS_SATELITE or ticker not in mapa:
+            continue
+        sector = mapa[ticker]
+        if sector in sectores or balance_inminente(ticker, DIAS_BLACKOUT_BALANCE):
+            continue
+        core.append(ticker)
+        sectores.add(sector)
+        if len(core) == 3:
+            break
+
+    objetivo = pesos_iguales(core, PRESUPUESTO_CORE)
+    faltante_core = PRESUPUESTO_CORE - sum(objetivo.values())
+    if faltante_core > 1e-12:
+        objetivo[REFUGIO_CASH_LIQUIDEZ] = faltante_core
+
+    beta_map, satelites = {}, []
+    for ticker in ranking:
+        if ticker not in ETFS_SATELITE:
+            continue
+        beta = calcular_beta(cierre[ticker], cierre[FILTRO_MACRO])
+        beta_map[ticker] = beta
+        if np.isfinite(beta) and beta >= BETA_MINIMA_SATELITE:
+            satelites.append(ticker)
+
+    satelite = satelites[0] if satelites else REFUGIO_CASH_LIQUIDEZ
+    objetivo[satelite] = objetivo.get(satelite, 0.0) + PRESUPUESTO_SATELITE
+
+    print("\nCORE:")
+    for ticker in core:
+        print(f"  {ticker:6s} | {mapa[ticker]:25s} | Mom {aprobados[ticker]:+.2%} | "
+              f"R2 {r2_map[ticker]:.2f} | Peso {objetivo[ticker]:.2%}")
+
+    if satelite == REFUGIO_CASH_LIQUIDEZ:
+        print(f"SATELITE: BIL | Ningun ETF aprobo tendencia y beta >= {BETA_MINIMA_SATELITE:.2f}")
     else:
-        precios = datos_raw
+        print(f"SATELITE: {satelite} | Mom {aprobados[satelite]:+.2%} | "
+              f"R2 {r2_map[satelite]:.2f} | Beta {beta_map[satelite]:.2f} | Peso 25.00%")
 
-    # Elimina columnas sin datos suficientes (mantenemos mínimo 80% de datos cargados)
-    precios_limpios = precios.dropna(thresh=int(len(precios) * 0.8), axis=1)
-    return precios_limpios
+    print("\nDIAGNOSTICO DE ETFs QUE SUPERARON TENDENCIA:")
+    candidatos = [t for t in ranking if t in ETFS_SATELITE]
+    if not candidatos:
+        print("  Ningun ETF supero los filtros previos de momentum, R2 y tendencia.")
+    for ticker in candidatos:
+        beta = beta_map.get(ticker, calcular_beta(cierre[ticker], cierre[FILTRO_MACRO]))
+        beta_txt = f"{beta:.2f}" if np.isfinite(beta) else "N/D"
+        estado = "APTO" if np.isfinite(beta) and beta >= BETA_MINIMA_SATELITE else "NO APTO"
+        print(f"  {ticker:5s} | Mom {aprobados[ticker]:+.2%} | R2 {r2_map[ticker]:.2f} | "
+              f"Beta {beta_txt} | {estado}")
 
-# ==============================================================================
-# 3. ALGORITMOS CUANTITATIVOS Y MÉTRICAS ROBUSTAS (EMA20 Y GATILLOS)
-# ==============================================================================
-def calcular_momentum_agresivo(precios_df):
-    """Fórmula Acelerada: 70% Retorno 1 Mes (21d) + 30% Retorno 3 Meses (63d)."""
-    r_1m = precios_df.pct_change(21)
-    r_3m = precios_df.pct_change(63)
-    score = (0.70 * r_1m) + (0.30 * r_3m)
-    return score.iloc[-1]
+    if not np.isclose(sum(objetivo.values()), 1.0):
+        raise RuntimeError("Los pesos objetivo no suman 100%")
+    return risk_on, objetivo
 
-def verificar_tendencia_ema20_robusta(precios_ticker):
-    """Filtro Técnico Individual: Comprueba si P > EMA20 limpiando NaNs."""
-    s_limpia = precios_ticker.dropna()
-    if len(s_limpia) < 20:
-        return False, 0.0, 0.0
 
-    ema_20 = s_limpia.ewm(span=20, adjust=False).mean()
-    precio_actual = float(s_limpia.iloc[-1])
-    ema_actual = float(ema_20.iloc[-1])
+# ============================== REBALANCEO ==============================
+def calcular_instrucciones_operativas(objetivo, actual, entradas, cash, cierre, maximo, minimo, estado):
+    max_estado = estado.setdefault("maximos_desde_entrada", {})
+    valor = sum(q * float(cierre[t].dropna().iloc[-1]) for t, q in actual.items()
+                if t in cierre.columns and not cierre[t].dropna().empty)
+    nav = valor + cash
+    filas = []
 
-    es_valido = not np.isnan(precio_actual) and not np.isnan(ema_actual)
-    es_alcista = es_valido and (precio_actual > ema_actual)
+    # 1. Definimos el multiplicador de volatilidad (margen de respiro)
+    multiplo_atr = 3.0
 
-    return es_alcista, precio_actual, ema_actual
+    for ticker in list(dict.fromkeys(list(objetivo) + list(actual))):
+        if ticker not in cierre.columns or cierre[ticker].dropna().empty:
+            logger.error("Sin precio para %s", ticker)
+            continue
 
-def evaluar_regimen_benchmark_spy(precios_spy):
-    """
-    Evalúa el régimen del Benchmark ($SPY) aplicando las dos cláusulas de activación Risk-Off:
-    1. Filtro de Amplitud del -0.5%: 1 cierre con P_SPY < 0.995 * EMA20 (Quiebre Violento)
-    2. Persistencia: 2 cierres diarios consecutivos por debajo de la EMA20
-    """
-    s_limpia = precios_spy.dropna()
-    if len(s_limpia) < 20:
-        return False, 0.0, 0.0, "Datos insuficientes"
+        p = float(cierre[ticker].dropna().iloc[-1])
+        q = int(actual.get(ticker, 0))
+        entrada = float(entradas.get(ticker, p))
+        peso = float(objetivo.get(ticker, 0.0))
+        protegido = ticker in {COBERTURA_BAJISTA, REFUGIO_RENTA_FIJA,
+                               REFUGIO_CASH_LIQUIDEZ} or peso == 0
+        stop, stop_activo, tipo = None, False, "N/A"
 
-    ema_20 = s_limpia.ewm(span=20, adjust=False).mean()
+        if not protegido:
+            # 2. Calculamos el ATR actual para el activo en cuestión
+            # Asume que la función calcular_atr ya está definida en el scope global
+            atr_actual = calcular_atr(cierre[ticker], maximo[ticker], minimo[ticker]).iloc[-1]
 
-    p_hoy = float(s_limpia.iloc[-1])
-    ema_hoy = float(ema_20.iloc[-1])
+            if q == 0 or ticker not in entradas:
+                stop, tipo = p * (1 - STOP_LOSS_INICIAL_PCT), "INICIAL"
+            else:
+                max_alc = max(float(max_estado.get(ticker, entrada)),
+                              float(maximo[ticker].dropna().iloc[-1]), p, entrada)
+                max_estado[ticker] = max_alc
 
-    p_ayer = float(s_limpia.iloc[-2])
-    ema_ayer = float(ema_20.iloc[-2])
+                # Mantenemos las barreras de protección estáticas como red de seguridad
+                inicial = entrada * (1 - STOP_LOSS_INICIAL_PCT)
+                breakeven = (entrada * (1 + BUFFER_BREAKEVEN_PCT)
+                             if max_alc >= entrada * (1 + UMBRAL_BREAKEVEN_PCT) else inicial)
 
-    umbral_amplitud = 0.995 * ema_hoy  # P_SPY < 0.995 * EMA20 (-0.5%)
+                # 3. Nueva lógica: Trailing Stop dinámico ajustado por volatilidad (ATR)
+                trailing = max_alc - (atr_actual * multiplo_atr)
 
-    # Evaluación de cláusulas bajistas
-    quiebre_amplitud = p_hoy < umbral_amplitud
-    dos_cierres_debajo = (p_hoy < ema_hoy) and (p_ayer < ema_ayer)
+                stop = max(inicial, breakeven, trailing)
+                stop_activo = p <= stop
 
-    if quiebre_amplitud:
-        es_risk_on = False
-        motivo = f"🔴 RISK-OFF (Gatillo Violento: Cierre con filtro -0.5% por debajo de EMA20 [${p_hoy:.2f} < ${umbral_amplitud:.2f}])"
-    elif dos_cierres_debajo:
-        es_risk_on = False
-        motivo = f"🔴 RISK-OFF (Gatillo Persistencia: 2 cierres consecutivos por debajo de EMA20 [Ayer: ${p_ayer:.2f}, Hoy: ${p_hoy:.2f}])"
-    else:
-        es_risk_on = True
-        motivo = f"🟢 RISK-ON (Estructura Alcista [${p_hoy:.2f} > EMA20 ${ema_hoy:.2f}])"
+                # Actualizamos la etiqueta para reflejar que es un trailing por ATR
+                tipo = "TRAILING ATR" if np.isclose(stop, trailing) and trailing > entrada else (
+                    "BREAKEVEN" if np.isclose(stop, breakeven) and breakeven > inicial else "INICIAL")
 
-    return es_risk_on, p_hoy, ema_hoy, motivo
-
-def calcular_betas_masivos(precios_df, benchmark_ticker="SPY", dias=252):
-    """Calcula el Beta rolling de 1 año respecto al SPY para todos los activos."""
-    retornos = precios_df.pct_change().dropna().tail(dias)
-    if benchmark_ticker not in retornos.columns:
-        return pd.Series(1.0, index=precios_df.columns)
-
-    covarianzas = retornos.cov()[benchmark_ticker]
-    varianza_bm = retornos[benchmark_ticker].var()
-    if varianza_bm == 0:
-        return pd.Series(1.0, index=precios_df.columns)
-
-    return covarianzas / varianza_bm
-
-# ==============================================================================
-# 4. ESCÁNER GLOBAL Y REBALANCEO DE CARTERA (REGLAS CAPÍTULO 2 - EMA20)
-# ==============================================================================
-def diagnosticar_y_escanear_sp500(datos, portafolio_actual=None):
-    sp_risk_on, sp_precio, sp_ema, sp_motivo = evaluar_regimen_benchmark_spy(datos[BENCHMARK])
-    fecha_evaluada = datos.index[-1].strftime("%Y-%m-%d")
-
-    print("\n" + "=" * 80)
-    print("   ESCÁNER CUANTITATIVO REBALANCEO S&P 500 | SISTEMA EMA20")
-    print("=" * 80)
-    print(f"Fecha Evaluada: {fecha_evaluada}")
-    print(f"Estado SPY -> Cierre: ${sp_precio:.2f} | EMA20: ${sp_ema:.2f}")
-    print(f"Diagnóstico de Régimen -> {sp_motivo}")
-
-    portafolio_objetivo = {}
-
-    # Excluir activos tácticos e instrumentos de control del cálculo general
-    activos_excluidos = [BENCHMARK, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ, COBERTURA_BAJISTA]
-    tickers_elegibles = [col for col in datos.columns if col not in activos_excluidos]
-    precios_elegibles = datos[tickers_elegibles]
-
-    # Cálculo masivo de métricas
-    scores_momentum = calcular_momentum_agresivo(precios_elegibles)
-    betas = calcular_betas_masivos(datos, benchmark_ticker=BENCHMARK)
-
-    # Evaluación continua de empresas con P > EMA20
-    activos_tendencia = {}
-    for t in tickers_elegibles:
-        es_alcista, _, _ = verificar_tendencia_ema20_robusta(datos[t])
-        if es_alcista and not np.isnan(scores_momentum.get(t, np.nan)):
-            activos_tendencia[t] = scores_momentum[t]
-
-    print(f"\n📊 Total de empresas en el S&P 500 que cumplen la condición P > EMA20: {len(activos_tendencia)}")
-    print("-" * 80)
-
-    # --------------------------------------------------------------------------
-    # ESCENARIO A: MERCADO ALCISTA ($SPY > EMA20) - RISK-ON
-    # --------------------------------------------------------------------------
-    if sp_risk_on:
-        # Ranking teórico ideal en tendencia alcista
-        ranking_core_teorico = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
-        top_3_teorico = [t for t, _ in ranking_core_teorico[:3]]
-
-        # --- APLICACIÓN DE FILTRO DE TOLERANCIA / ROTACIÓN MÍNIMA EN CORE ---
-        top_3_core = []
-        if portafolio_actual and "CORE" in portafolio_actual and len(portafolio_actual["CORE"]) > 0:
-            core_vigente = portafolio_actual["CORE"]
-            print("\n⚙️ EVALUANDO FILTRO DE TOLERANCIA Y ROTACIÓN MÍNIMA (Core Vigente):")
-
-            for t_actual in core_vigente:
-                # Si el activo actual sigue en tendencia alcista P > EMA20
-                if t_actual in activos_tendencia:
-                    score_actual = activos_tendencia[t_actual]
-                    # Buscar el mejor candidato externo que aún no esté en el nuevo core
-                    candidatos = [t for t in top_3_teorico if t not in top_3_core and t != t_actual]
-
-                    if candidatos:
-                        mejor_candidato = candidatos[0]
-                        score_candidato = activos_tendencia[mejor_candidato]
-                        diff = score_candidato - score_actual
-
-                        if diff > UMBRAL_ROTACION_MINIMA:
-                            print(f" 🔄 REEMPLAZO JUSTIFICADO: {mejor_candidato} (Score: {score_candidato:.4f}) supera a {t_actual} (Score: {score_actual:.4f}) por +{diff:.4f} > {UMBRAL_ROTACION_MINIMA}")
-                            top_3_core.append(mejor_candidato)
-                        else:
-                            print(f" ✋ MANTENER POSICIÓN: {t_actual} (Score: {score_actual:.4f}) se retiene vs {mejor_candidato} (Diff: +{diff:.4f} <= {UMBRAL_ROTACION_MINIMA})")
-                            top_3_core.append(t_actual)
-                    else:
-                        top_3_core.append(t_actual)
-                else:
-                    print(f" ❌ VENTA REQUERIDA: {t_actual} perdió P > EMA20. Se sustituye por candidato ideal.")
-
-            # Completar cupos si hicieron falta reemplazos directos
-            for t_cand in top_3_teorico:
-                if len(top_3_core) < 3 and t_cand not in top_3_core:
-                    top_3_core.append(t_cand)
+        target = 0 if stop_activo else int((nav * peso) // p)
+        delta = target - q
+        if stop_activo:
+            orden = f"VENDER ALL ({q}) | STOP ACTIVADO"
+        elif delta > 0:
+            orden = f"COMPRAR {delta}"
+        elif delta < 0:
+            orden = f"VENDER ALL ({abs(delta)})" if target == 0 else f"VENDER {abs(delta)}"
         else:
-            top_3_core = top_3_teorico
+            orden = "MANTENER" if q else "NO OPERAR"
 
-        print("\n🔥 MÓDULO CORE SELECCIONADO (75% NAV - Top 3 Momentum Alcistas):")
-        for t in top_3_core:
-            portafolio_objetivo[t] = 0.25
-            print(f" -> {t:6s} | Score Momentum: {scores_momentum[t]:7.4f} | Beta vs SPY: {betas.get(t, 1.0):.2f} | Peso: 25.0%")
+        filas.append({"Ticker": ticker, "P. Compra": f"${entrada:.2f}" if ticker in entradas else "N/A",
+                      "P. Actual": f"${p:.2f}", "Acc. Hoy": q, "Acc. Target": target,
+                      "ORDEN NETA": orden, "Monto Delta": f"${abs(delta*p):,.2f}",
+                      "Peso Target": f"{peso:.1%}",
+                      "Stop Dinamico": "N/A" if stop is None else f"${stop:.2f}",
+                      "Estado Stop": tipo})
 
-        # Relleno a cash/liquidez si en todo el S&P 500 hay menos de 3 acciones alcistas
-        if len(top_3_core) < 3:
-            faltantes = 3 - len(top_3_core)
-            peso_refugio = faltantes * 0.25
-            portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + peso_refugio
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Falta de cuotas Core -> Liquidez) | Peso: {peso_refugio*100:.1f}%")
+    reporte = pd.DataFrame(filas)
+    print("\n" + "=" * 120)
+    print(f"MATRIZ DE REBALANCEO | NAV TOTAL: ${nav:,.2f}")
+    print(reporte.to_string(index=False))
+    print("=" * 120)
+    return reporte, estado
 
-        # --- MÓDULO SATÉLITE (25% Total -> Top 1 Alto Beta >= 1.20 EXCLUYENDO EL CORE) ---
-        candidatos_cohetes = {}
-        for t, score in activos_tendencia.items():
-            if t not in top_3_core:
-                beta_t = betas.get(t, 1.0)
-                if beta_t >= 1.20:
-                    candidatos_cohetes[t] = (score, beta_t)
 
-        print("\n🚀 MÓDULO SATÉLITE SELECCIONADO (25% NAV - Top 1 Cohete Alto Beta Exclusivo):")
-        if candidatos_cohetes:
-            top_1_sat_teorico = max(candidatos_cohetes, key=lambda x: candidatos_cohetes[x][0])
-            score_win_teorico, beta_win_teorico = candidatos_cohetes[top_1_sat_teorico]
-
-            # Tolerancia en Satélite
-            top_1_sat = top_1_sat_teorico
-            if portafolio_actual and "SATELITE" in portafolio_actual and portafolio_actual["SATELITE"]:
-                sat_actual = portafolio_actual["SATELITE"]
-                if sat_actual in candidatos_cohetes and sat_actual not in top_3_core:
-                    score_actual = candidatos_cohetes[sat_actual][0]
-                    diff_sat = score_win_teorico - score_actual
-                    if diff_sat <= UMBRAL_ROTACION_MINIMA:
-                        print(f" ✋ MANTENER SATÉLITE: {sat_actual} (Score: {score_actual:.4f}) se retiene vs {top_1_sat_teorico} (Diff: +{diff_sat:.4f} <= {UMBRAL_ROTACION_MINIMA})")
-                        top_1_sat = sat_actual
-                    else:
-                        print(f" 🔄 ROTACIÓN SATÉLITE: {top_1_sat_teorico} supera a {sat_actual} por +{diff_sat:.4f} > {UMBRAL_ROTACION_MINIMA}")
-
-            score_win, beta_win = candidatos_cohetes[top_1_sat]
-            portafolio_objetivo[top_1_sat] = 0.25
-            print(f" -> {top_1_sat:6s} | Score Momentum: {score_win:7.4f} | Beta vs SPY: {beta_win:.2f} | Peso: 25.0%")
-        else:
-            portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = portafolio_objetivo.get(REFUGIO_CASH_LIQUIDEZ, 0.0) + 0.25
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} (Sin acciones Beta >= 1.2 en tendencia fuera del Core -> Liquidez) | Peso: 25.0%")
-
-    # --------------------------------------------------------------------------
-    # ESCENARIO B: MERCADO BAJISTA ($SPY < EMA20 / GATILLOS) - PROTOCOLO DEFENSIVO HÍBRIDO
-    # --------------------------------------------------------------------------
-    else:
-        print("\n🛡️ EJECUTANDO PROTOCOLO DEFENSIVO HÍBRIDO (Estrategia Bajista - EMA20):")
-
-        # --- MÓDULO SATÉLITE (25% NAV) -> Rotación a Cobertura Activa ($PSQ) ---
-        portafolio_objetivo[COBERTURA_BAJISTA] = 0.25
-        print(f"\n⚡ MÓDULO SATÉLITE (25% NAV - Cobertura Activa Inversa):")
-        print(f" -> {COBERTURA_BAJISTA:6s} | Alfa Bajista (Inverse -1x QQQ) | Peso: 25.0%")
-
-        # --- MÓDULO CORE (75% NAV) -> Acciones Resilientes vs Renta Fija / Cash ---
-        ranking_core = sorted(activos_tendencia.items(), key=lambda x: x[1], reverse=True)
-
-        print(f"\n🛡️ MÓDULO CORE (75% NAV - Resiliencia / Renta Fija / Cash):")
-        if ranking_core:
-            top_2_resilientes = [t for t, _ in ranking_core[:2]]
-            peso_por_activo = 0.25 / len(top_2_resilientes)
-
-            for t in top_2_resilientes:
-                portafolio_objetivo[t] = peso_por_activo
-                print(f" -> {t:6s} | Resiliente (P > EMA20) | Score: {scores_momentum[t]:7.4f} | Peso: {peso_por_activo*100:.1f}%")
-
-            peso_rf = 0.50
-            portafolio_objetivo[REFUGIO_RENTA_FIJA] = peso_rf
-            print(f" -> {REFUGIO_RENTA_FIJA:6s} | Refugio Renta Fija (Treasuries 1-3 años) | Peso: {peso_rf*100:.1f}%")
-        else:
-            peso_liquidez_core = 0.75
-            portafolio_objetivo[REFUGIO_CASH_LIQUIDEZ] = peso_liquidez_core
-            print(f" ⚠️ PÁNICO SISTÉMICO: Ningún activo sostiene P > EMA20.")
-            print(f" -> {REFUGIO_CASH_LIQUIDEZ:6s} | Preservación Absoluta: 100% Core a Cash ($BIL) | Peso: {peso_liquidez_core*100:.1f}%")
-
-    return portafolio_objetivo, datos.iloc[-1]
-
-# ==============================================================================
-# 5. GENERACIÓN DE ÓRDENES Y CÁLCULO DE CAPITAL
-# ==============================================================================
-def calcular_instrucciones(portafolio_objetivo, precios_actuales, nav_actual):
-    print("\n" + "=" * 80)
-    print(f"  ÓRDENES DE REBALANCEO | NAV ACTUAL EN SIMULADOR: ${nav_actual:,.2f} USD")
-    print("=" * 80)
-
-    resumen = []
-    total_peso = sum(portafolio_objetivo.values())
-
-    for ticker, peso in portafolio_objetivo.items():
-        precio = float(precios_actuales[ticker])
-        capital_target = nav_actual * peso
-        acciones = int(capital_target // precio)
-
-        if ticker in [COBERTURA_BAJISTA, REFUGIO_RENTA_FIJA, REFUGIO_CASH_LIQUIDEZ]:
-            stop_loss_str = "N/A (Táctico/Refugio)"
-        else:
-            stop_loss = precio * 0.95
-            stop_loss_str = f"${stop_loss:.2f}"
-
-        funcao = "Cobertura Inversa" if ticker == COBERTURA_BAJISTA else (
-            "Renta Fija Refugio" if ticker == REFUGIO_RENTA_FIJA else (
-                "Cash / Liquidez" if ticker == REFUGIO_CASH_LIQUIDEZ else "Acción RV"
-            )
-        )
-
-        resumen.append(
-            {
-                "Ticker": ticker,
-                "Función": funcao,
-                "Peso Target": f"{peso * 100:.1f}%",
-                "Monto Target": f"${capital_target:,.2f}",
-                "Precio Cierre": f"${precio:.2f}",
-                "Acciones Objetivo": acciones,
-                "Stop-Loss (-5%)": stop_loss_str,
-            }
-        )
-
-    df = pd.DataFrame(resumen)
-    print(df.to_string(index=False))
-    print("-" * 80)
-    print(f"Suma Total de Pesos Asignados: {total_peso * 100:.1f}%")
-    print("=" * 80)
-    return df
-
-# ==============================================================================
-# 6. EJECUCIÓN
-# ==============================================================================
 if __name__ == "__main__":
-    NAV_FLOTANTE_ACTUAL = 98196.64
+    PORTAFOLIO_ACTUAL_CANTIDADES = {
+        "VLO": 60,
+        "IQV": 71,
+        "SKYY": 135
 
-    datos_mercado = obtener_datos_masivos()
-    target_portfolio, ultimos_precios = diagnosticar_y_escanear_sp500(datos_mercado, portafolio_actual=PORTAFOLIO_ACTUAL)
-    reporte_df = calcular_instrucciones(target_portfolio, ultimos_precios, nav_actual=NAV_FLOTANTE_ACTUAL)
-        )
+    }
+
+    PRECIOS_ENTRADA = {
+        "VLO": 360.11,
+        "IQV": 270.87,
+        "SKYY": 165.78
+
+    }
+
+    CASH_DISPONIBLE_USD = 84654.33
+
+    estado = cargar_estado()
+    p_cierre, p_max, p_min, p_volumen, mapa = obtener_datos_masivos(
+        dias_calendario=500,
+        tickers_extra=list(PORTAFOLIO_ACTUAL_CANTIDADES),
+    )
+    _, target = diagnosticar_y_escanear_universo(p_cierre, p_max, p_min, p_volumen, mapa)
+    reporte, estado = calcular_instrucciones_operativas(
+        target, PORTAFOLIO_ACTUAL_CANTIDADES, PRECIOS_ENTRADA,
+        CASH_DISPONIBLE_USD, p_cierre, p_max, p_min, estado
+    )
+    guardar_estado(estado)
+    reporte.to_csv("reporte_rebalanceo.csv", index=False, encoding="utf-8-sig")
