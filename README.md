@@ -22,6 +22,8 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 
 ## 📁 Estructura del Repositorio
 
+```text
+
 .
 ├── README.md
 ├── requirements.txt
