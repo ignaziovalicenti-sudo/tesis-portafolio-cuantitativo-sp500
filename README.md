@@ -22,7 +22,6 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 
 ## 📁 Estructura del Repositorio
 
-📁 Estructura del Repositorio
 
 .
 ├── README.md
