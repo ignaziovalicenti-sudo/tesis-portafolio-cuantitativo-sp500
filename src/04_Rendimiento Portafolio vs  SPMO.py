@@ -4,6 +4,8 @@
 Script 2
 # ==========================================
 # SCRIPT 1: SELECCIÓN Y CARGA DEL ARCHIVO
+# El archivo debe ser extraido del simulador y 
+# almacenado en la computadora
 # ==========================================
 
 try:
