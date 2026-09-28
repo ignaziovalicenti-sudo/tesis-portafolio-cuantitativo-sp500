@@ -1,4 +1,4 @@
-# tesis-portafolio-cuantitativo-sp500
+# tesis-portafolio-cuantitativo-spmo
 Tesina Maestria en Finanzas
 # Modelo Cuantitativo de Asignación de Activos Core/Satélite con Protocolo Defensivo Híbrido
 
