@@ -22,15 +22,30 @@ El sistema implementa una estrategia de inversión 100% sistemática que combina
 
 ## 📁 Estructura del Repositorio
 
-```text
+📁 Estructura del Repositorio
+
 .
-.
-├── README.md                                 <-- Presentación del proyecto y guía de ejecución
-├── requirements.txt                          <-- Librerías de Python requeridas
+├── README.md
+├── requirements.txt
 │
-├── src/                                      <-- Código fuente del modelo
-│   ├── 01_monitoreo_regimen_mercado.py       <-- Evaluador diario del Benchmark (SPY vs EMA20)
-│   ├── 02_monitor_salud_posiciones.py        <-- Evaluación diario de posiciones individuales (P < EMA2)
-│   └── 03_rebalanceo_adaptativo.py           <-- Motor de ordenes (Ejecución programada y cambio de regimen)
-│
-└── 
+├── src/
+│   ├── 01_Monitoreo_regimen_mercado.py
+│   │      Evaluador diario del régimen de mercado
+│   │      (SPY vs EMA20)
+│   │
+│   ├── 02_Monitor_Salud_Posiciones.py
+│   │      Monitoreo de salud de posiciones abiertas
+│   │      (precio vs EMA2 y reglas de protección)
+│   │
+│   ├── 03_Rebalanceo_Adaptativo.py
+│   │      Motor de rebalanceo y asignación Core/Satélite
+│   │
+│   ├── 04_Rendimiento_Portafolio_vs_SPMO.py
+│   │      Cálculo de rendimiento acumulado del portafolio
+│   │      y comparación contra el benchmark SPMO
+│   │
+│   └── 05_Alfa_Error_Riesgo_Activo_del_Portafolio.py
+│          Métricas de desempeño:
+│          alfa, tracking error,
+│          riesgo activo e información relativa
+│          respecto al benchmark
